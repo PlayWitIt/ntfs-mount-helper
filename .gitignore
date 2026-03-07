@@ -8,5 +8,8 @@ Thumbs.db
 *.swp
 *.swo
 
+# Local archive
+.Zicebox/
+
 # Config (user-specific)
 .config/ntfs-mount-helper/config.sh
