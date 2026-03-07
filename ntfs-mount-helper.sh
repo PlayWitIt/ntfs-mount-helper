@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="2.0.0"
 SCRIPT_NAME="$(basename "$0")"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ntfs-mount-helper"
 CONFIG_FILE="$CONFIG_DIR/config.sh"
@@ -43,7 +43,8 @@ function prompt() { echo -e "${CYAN}[?]${NC} $1"; }
 function print_header() {
     echo -e "${BOLD}${BLUE}"
     echo "========================================"
-    echo "     NTFS Mount Helper v$VERSION"
+    echo "  NTFS Mount Helper v$VERSION"
+    echo "  No Windows Required"
     echo "========================================"
     echo -e "${NC}"
 }
@@ -173,6 +174,216 @@ function get_mount_point() {
     echo "$MOUNT_BASE/$label"
 }
 
+function try_mount_stage() {
+    local device="$1"
+    local mount_point="$2"
+    local fs_type="$3"
+    local options="$4"
+    local description="$5"
+    
+    if [[ "$verbose" == true ]]; then
+        msg "Stage: $description"
+        msg "Trying: mount -t $fs_type -o $options $device $mount_point"
+    fi
+    
+    if sudo mount -t "$fs_type" -o "$options" "$device" "$mount_point" 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+function mount_with_recovery() {
+    local device="$1"
+    local mount_point="$2"
+    local label="$3"
+    local uuid="$4"
+    local size="$5"
+    local dirty="$6"
+    
+    local uid_opts="uid=$USER_UID,gid=$USER_GID,umask=0022"
+    
+    if [[ "$dirty" == "dirty" ]]; then
+        echo ""
+        warn "=============================================="
+        warn "  Volume is marked DIRTY"
+        warn "  Attempting multi-stage recovery..."
+        warn "=============================================="
+        echo ""
+    fi
+    
+    local stage=1
+    local mount_success=false
+    
+    while [[ $stage -le 6 ]]; do
+        case $stage in
+            1)
+                msg "[Stage 1/6] ntfs3 with force (standard approach)..."
+                if try_mount_stage "$device" "$mount_point" "ntfs3" "force,rw,$uid_opts" "ntfs3 force"; then
+                    mount_success=true
+                fi
+                ;;
+            2)
+                msg "[Stage 2/6] ntfs3 read-only (safest)..."
+                if try_mount_stage "$device" "$mount_point" "ntfs3" "ro,$uid_opts" "ntfs3 readonly"; then
+                    mount_success=true
+                    warn "Mounted READ-ONLY. You can copy data but not modify."
+                fi
+                ;;
+            3)
+                msg "[Stage 3/6] ntfs-3g (FUSE driver - more forgiving)..."
+                if try_mount_stage "$device" "$mount_point" "ntfs-3g" "force,rw,$uid_opts" "ntfs-3g force"; then
+                    mount_success=true
+                fi
+                ;;
+            4)
+                msg "[Stage 4/6] ntfs-3g read-only..."
+                if try_mount_stage "$device" "$mount_point" "ntfs-3g" "ro,$uid_opts" "ntfs-3g readonly"; then
+                    mount_success=true
+                    warn "Mounted READ-ONLY. You can copy data but not modify."
+                fi
+                ;;
+            5)
+                msg "[Stage 5/6] Running ntfsfix and retrying..."
+                if command -v ntfsfix &>/dev/null; then
+                    sudo ntfsfix -d "$device" 2>&1 | head -3 || true
+                    if try_mount_stage "$device" "$mount_point" "ntfs3" "force,rw,$uid_opts" "ntfs3 after ntfsfix"; then
+                        mount_success=true
+                    fi
+                else
+                    warn "ntfsfix not available"
+                fi
+                ;;
+            6)
+                msg "[Stage 6/6] Last resort: ntfsfix full repair..."
+                if command -v ntfsfix &>/dev/null; then
+                    sudo ntfsfix "$device" 2>&1 | head -5 || true
+                    if try_mount_stage "$device" "$mount_point" "ntfs3" "force,rw,$uid_opts" "ntfs3 after full ntfsfix"; then
+                        mount_success=true
+                    fi
+                fi
+                ;;
+        esac
+        
+        if [[ "$mount_success" == true ]]; then
+            return 0
+        fi
+        
+        ((stage++))
+    done
+    
+    return 1
+}
+
+function show_recovery_options() {
+    local device="$1"
+    local mount_point="$2"
+    
+    echo ""
+    error "=============================================="
+    error "  All recovery stages failed"
+    error "=============================================="
+    echo ""
+    echo "Your options (in order of recommendation):"
+    echo ""
+    echo -e "${YELLOW}1.${NC} Use ${BOLD}recovery mode${NC} to copy your data"
+    echo "   Command: $SCRIPT_NAME recovery $device"
+    echo ""
+    echo -e "${YELLOW}2.${NC} Clone the drive to a new disk using ntfsclone"
+    echo "   This can sometimes recover data from corrupted drives"
+    echo "   Command: sudo ntfsclone --overfile /path/to/backup.img $device"
+    echo ""
+    echo -e "${YELLOW}3.${NC} Boot into Windows and run: ${BOLD}chkdsk /f${NC}"
+    echo "   This is the most reliable repair method"
+    echo ""
+    echo -e "${YELLOW}4.${NC} Use TestDisk/PhotoRec for data recovery"
+    echo "   Install: sudo apt install testdisk"
+    echo ""
+}
+
+function recovery_mode() {
+    local device="${1:-}"
+    
+    if [[ -z "$device" ]]; then
+        device=$(select_device "recover")
+        [[ -z "$device" ]] && exit 0
+    fi
+    
+    if [[ ! -b "$device" ]]; then
+        error "Invalid device: $device"
+        exit 1
+    fi
+    
+    local label uuid size current_mount
+    label=$(lsblk -rn -o LABEL "$device" | head -1)
+    uuid=$(lsblk -rn -o UUID "$device" | head -1)
+    size=$(lsblk -rn -o SIZE "$device" | head -1)
+    current_mount=$(lsblk -rn -o MOUNTPOINT "$device" | head -1)
+    
+    echo ""
+    warn "=============================================="
+    warn "  NTFS Recovery Mode"
+    warn "  Read-only data extraction"
+    warn "=============================================="
+    echo ""
+    echo "Device: $device"
+    echo "Label: ${label:-N/A}"
+    echo "Size: $size"
+    echo ""
+    
+    if [[ -n "$current_mount" ]]; then
+        warn "Device already mounted at: $current_mount"
+        prompt "Use this mount point? [Y/n] "
+        read -r answer
+        if [[ "$answer" =~ ^[Nn]$ ]]; then
+            exit 0
+        fi
+        local mount_point="$current_mount"
+    else
+        local mount_point
+        mount_point=$(get_mount_point "$device")
+        
+        load_config
+        local uid_opts="uid=$USER_UID,gid=$USER_GID,umask=0022"
+        
+        msg "Attempting read-only mount..."
+        
+        if try_mount_stage "$device" "$mount_point" "ntfs3" "ro,$uid_opts" "ntfs3 readonly"; then
+            success "Mounted read-only!"
+        elif try_mount_stage "$device" "$mount_point" "ntfs-3g" "ro,$uid_opts" "ntfs-3g readonly"; then
+            success "Mounted read-only!"
+        else
+            error "Could not mount read-only"
+            prompt "Try force mount anyway? [y/N] "
+            read -r answer
+            if [[ "$answer" =~ ^[Yy]$ ]]; then
+                sudo mkdir -p "$mount_point"
+                if sudo mount -t ntfs3 -o "force,ro,$uid_opts" "$device" "$mount_point" 2>&1; then
+                    success "Mounted with force-readonly"
+                else
+                    error "All attempts failed"
+                    show_recovery_options "$device" "$mount_point"
+                    return 1
+                fi
+            else
+                return 1
+            fi
+        fi
+    fi
+    
+    echo ""
+    success "=============================================="
+    success "  RECOVERY MOUNT SUCCESSFUL"
+    success "=============================================="
+    echo ""
+    echo -e "${GREEN}Mount point: $mount_point${NC}"
+    echo ""
+    echo "You can now copy your data:"
+    echo "  cp -r $mount_point ~/backup/"
+    echo ""
+    warn "When done, unmount with: sudo umount $mount_point"
+    echo ""
+}
+
 function mount_ntfs() {
     local device="${1:-}"
     local readonly_mount=""
@@ -184,7 +395,7 @@ function mount_ntfs() {
     shift || true
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -r|--readonly) readonly_mount="ro"; force_mount="ro"; shift ;;
+            -r|--readonly) readonly_mount="ro"; shift ;;
             -f|--force) force_mount="force"; shift ;;
             -n|--nofix) auto_fix=false; shift ;;
             -v|--verbose) verbose=true; shift ;;
@@ -244,89 +455,49 @@ function mount_ntfs() {
     local dirty
     dirty=$(is_volume_dirty "$device")
     
-    if [[ "$dirty" == "dirty" ]]; then
-        warn "Volume is marked as DIRTY!"
-        
-        if [[ "$auto_fix" == true ]]; then
-            prompt "Attempt auto-fix with ntfsfix? [Y/n] "
-            read -r answer
-            if [[ "$answer" =~ ^[Yy]*$ ]] || [[ -z "$answer" ]]; then
-                msg "Running ntfsfix on $device..."
-                if ! command -v ntfsfix &>/dev/null; then
-                    warn "ntfsfix not found. Install ntfs-3g package."
-                else
-                    if [[ "$dry_run" == true ]]; then
-                        echo "[DRY-RUN] Would run: sudo ntfsfix -d $device"
-                    else
-                        sudo ntfsfix -d "$device" 2>&1 | head -5 || true
-                        success "Auto-fix complete."
-                    fi
-                fi
-            fi
-        fi
-        
-        if [[ -z "$force_mount" ]]; then
-            warn "Mount will be forced. Data corruption is possible!"
-            prompt "Continue with force mount? [y/N] "
-            read -r answer
-            if [[ ! "$answer" =~ ^[Yy]$ ]]; then
-                msg "Mount cancelled."
-                exit 0
-            fi
-            force_mount="force"
-        fi
-    fi
-    
-    local mount_opts
-    if [[ -n "$readonly_mount" ]]; then
-        mount_opts="${force_mount},${readonly_mount},uid=$USER_UID,gid=$USER_GID,umask=0022"
-    else
-        mount_opts="${force_mount:-force},rw,uid=$USER_UID,gid=$USER_GID,umask=0022"
-    fi
-    
     if [[ "$dry_run" == true ]]; then
-        echo "[DRY-RUN] Would execute:"
-        echo "  sudo mkdir -p $mount_point"
-        echo "  sudo mount -t ntfs3 -o $mount_opts $device $mount_point"
-        echo ""
-        echo "Mount options: $mount_opts"
+        echo "[DRY-RUN] Would attempt multi-stage recovery on: $device"
+        echo "Mount point: $mount_point"
         exit 0
     fi
     
     msg "Creating mount point: $mount_point"
     sudo mkdir -p "$mount_point"
     
-    msg "Mounting $device to $mount_point..."
-    if sudo mount -t ntfs3 -o "$mount_opts" "$device" "$mount_point" 2>&1; then
+    if [[ -n "$readonly_mount" ]]; then
+        msg "Attempting read-only mount..."
+        local uid_opts="uid=$USER_UID,gid=$USER_GID,umask=0022"
+        
+        if try_mount_stage "$device" "$mount_point" "ntfs3" "ro,$uid_opts" "ntfs3 readonly"; then
+            success "Mounted read-only!"
+        elif try_mount_stage "$device" "$mount_point" "ntfs-3g" "ro,$uid_opts" "ntfs-3g readonly"; then
+            success "Mounted read-only!"
+        else
+            error "Could not mount read-only"
+            return 1
+        fi
+    elif mount_with_recovery "$device" "$mount_point" "$label" "$uuid" "$size" "$dirty"; then
         success "Mounted successfully!"
-        echo ""
-        echo -e "${GREEN}========================================${NC}"
-        echo -e "${GREEN}  Device:   $device${NC}"
-        echo -e "${GREEN}  Label:    ${label:-N/A}${NC}"
-        echo -e "${GREEN}  UUID:     ${uuid:-N/A}${NC}"
-        echo -e "${GREEN}  Size:     $size${NC}"
-        echo -e "${GREEN}  Mount:    $mount_point${NC}"
-        echo -e "${GREEN}  Options:  ${mount_opts//,/ }${NC}"
-        echo -e "${GREEN}========================================${NC}"
-        
-        if [[ -n "$label" && "$label" != "null" ]]; then
-            sudo chown -R "$USER_UID:$USER_GID" "$mount_point" 2>/dev/null || true
-        fi
-        
-        return 0
     else
-        error "Failed to mount $device"
-        msg "Check dmesg for details: sudo dmesg | tail -20"
-        
-        if [[ "$dirty" == "dirty" ]]; then
-            echo ""
-            warn "This device is marked dirty. Alternative options:"
-            echo "  1. Boot into Windows and run: chkdsk /f"
-            echo "  2. Use: sudo mount -t ntfs3 -o ro,force $device $mount_point"
-            echo "  3. Use ntfsfix: sudo ntfsfix -b $device (backup mode)"
-        fi
+        error "Failed to mount after all recovery attempts"
+        show_recovery_options "$device" "$mount_point"
         return 1
     fi
+    
+    echo ""
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}  Device:   $device${NC}"
+    echo -e "${GREEN}  Label:    ${label:-N/A}${NC}"
+    echo -e "${GREEN}  UUID:     ${uuid:-N/A}${NC}"
+    echo -e "${GREEN}  Size:     $size${NC}"
+    echo -e "${GREEN}  Mount:    $mount_point${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    
+    if [[ -n "$label" && "$label" != "null" ]]; then
+        sudo chown -R "$USER_UID:$USER_GID" "$mount_point" 2>/dev/null || true
+    fi
+    
+    return 0
 }
 
 function unmount_ntfs() {
