@@ -76,7 +76,7 @@ sudo dnf install ntfs-3g eject
 
 1. Download the script:
 ```bash
-curl -O https://raw.githubusercontent.com/yourrepo/ntfs-mount-helper/main/ntfs-mount-helper.sh
+curl -O https://raw.githubusercontent.com/PlayWitIt/ntfs-mount-helper/main/ntfs-mount-helper.sh
 ```
 
 2. Make it executable:
@@ -326,7 +326,7 @@ sudo pacman -S ntfs-3g
 
 ## License
 
-MIT License - Free to use, modify, and distribute.
+MIT License - Copyright (c) 2026 PlayWit Creations. Free to use, modify, and distribute.
 
 ---
 

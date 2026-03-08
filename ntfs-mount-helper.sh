@@ -2,6 +2,7 @@
 # ========================================
 # NTFS Mount Helper
 # A user-friendly tool for mounting dirty NTFS volumes on Linux
+# Author: PlayWit Creations
 # ========================================
 set -euo pipefail
 VERSION="2.0.0"
